@@ -145,7 +145,8 @@ def main():
                 continue
             if bool(row["DUO"]) or bool(row["KONG"]):
                 side = "🔴 做多 ↑" if row["DUO"] else "🟢 做空 ↓"
-                msgs.append(f"- **{sym} {per}{'日线' if per=='D' else '分钟'}** {side}  "
+                # 企业微信 text 消息不渲染 Markdown，不要用 ** 加粗
+                msgs.append(f"{sym} {per}{'日线' if per=='D' else '分钟'}  {side}  "
                             f"收盘 {row['close']}  K线 {bar_id}")
                 state[key] = bar_id
             time.sleep(0.5)
