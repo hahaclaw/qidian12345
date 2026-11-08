@@ -1,0 +1,42 @@
+name: qidian12345-signal
+
+on:
+  schedule:
+    # GitHub 用 UTC。北京时间 9:00-15:45 与 21:00-02:45 每15分钟一次（含夜盘）
+    - cron: "*/15 1-7 * * 1-5"
+    - cron: "*/15 13-18 * * 1-5"
+    - cron: "*/15 13-23 * * 0"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: qidian-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: 扫描并推送
+        env:
+          WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+        run: python scan.py
+
+      - name: 保存去重状态
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@users.noreply.github.com"
+          git add state.json
+          git diff --cached --quiet || (git commit -m "更新去重状态 [skip ci]" && git push)
