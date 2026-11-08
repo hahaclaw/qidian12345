@@ -6,6 +6,7 @@
 initialized module 'pandas'）。
 """
 import os, json, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import requests
 import pandas as pd
@@ -20,7 +21,11 @@ WECOM_WEBHOOK = os.environ.get("WECOM_WEBHOOK", "")   # 企业微信群机器人
 STATE_FILE = "state.json"
 EXCLUDE = set()                        # 不想扫的品种代码，例如 {"WR0", "BB0"}
 STALE_DAYS = 10                        # 最后一根K线超过这么多天视为停牌，跳过
+WORKERS = 8                            # 并发取数线程数
 BJ = timezone(timedelta(hours=8))
+
+# 新浪 futures_display_main_sina() 漏掉但能正常取数的主力品种
+EXTRA = {"TL0": ("30年期国债", "cffex"), "T0": ("10年期国债", "cffex")}
 
 # 接口失败时的回退品种表（六大交易所，新浪主力连续代码 = 品种代码+0）
 FALLBACK = {
@@ -37,12 +42,21 @@ def now_bj():
     return datetime.now(BJ)
 
 
+def _clean_name(name: str) -> str:
+    """去掉新浪名称里的“连续”“期货”等后缀，只留品种名"""
+    return str(name).replace("连续", "").replace("期货", "").strip()
+
+
 def get_symbols():
     """返回 [(代码, 名称, 交易所)]，优先从新浪动态获取全部主力连续合约"""
     try:
         df = ak.futures_display_main_sina()
-        out = [(r["symbol"], r["name"], r.get("exchange", "")) for _, r in df.iterrows()]
+        out = [(r["symbol"], _clean_name(r["name"]), r.get("exchange", "")) for _, r in df.iterrows()]
         if len(out) >= 40:
+            have = {s[0] for s in out}
+            for code, (nm, ex) in EXTRA.items():
+                if code not in have:
+                    out.append((code, nm, ex))
             return [s for s in out if s[0] not in EXCLUDE]
     except Exception as e:
         print("动态获取主力合约列表失败，使用内置表：", e)
@@ -127,6 +141,22 @@ def wecom_push(text: str) -> bool:
     return ok
 
 
+def fetch_all(symbols):
+    """并发拉取所有 (品种, 周期) 的K线。返回 {(sym, per): DataFrame}"""
+    tasks = [(sym, per) for sym, _, _ in symbols for per in PERIODS]
+    data, failed = {}, []
+    with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+        futures = {pool.submit(fetch, sym, per): (sym, per) for sym, per in tasks}
+        for fut in as_completed(futures):
+            sym, per = futures[fut]
+            try:
+                data[(sym, per)] = fut.result()
+            except Exception as e:
+                print(f"{sym}-{per} 取数失败: {e}")
+                failed.append(f"{sym}-{per}")
+    return data, failed
+
+
 def main():
     try:
         state = json.load(open(STATE_FILE, encoding="utf-8"))
@@ -134,28 +164,30 @@ def main():
         state = {}
     symbols = get_symbols()
     now = now_bj()
-    print(f"扫描标的 {len(symbols)} 个 × 周期 {PERIODS}")
-    duo_msgs, kong_msgs = [], []
-    stale, failed = [], []
+    print(f"扫描标的 {len(symbols)} 个 × 周期 {PERIODS}，并发 {WORKERS} 线程")
 
+    t0 = time.time()
+    data, failed = fetch_all(symbols)
+    print(f"取数完成：成功 {len(data)} 个，失败 {len(failed)} 个，耗时 {time.time()-t0:.0f} 秒")
+
+    duo_msgs, kong_msgs = [], []
+    stale = 0
     for sym, name, ex in symbols:
         for per in PERIODS:
-            try:
-                df = calc(fetch(sym, per))
-            except Exception as e:
-                print(f"{sym}-{per} 取数失败: {e}")
-                failed.append(f"{sym}-{per}")
+            df = data.get((sym, per))
+            if df is None or df.empty:
                 continue
             if len(df) < L2 + 5:
                 continue
             # 停牌品种：最后一根K线停在很久以前，跳过，避免推历史僵尸信号
             last_dt = pd.to_datetime(df["datetime"].iloc[-1])
             if (now.replace(tzinfo=None) - last_dt).days > STALE_DAYS:
-                stale.append(f"{sym}-{per}")
+                stale += 1
                 continue
             # 日线：盘中最后一根是当天未收盘的K线，判断会产出假信号，跳过
             if per == "D" and last_dt.date() == now.date() and now.hour < 15:
                 continue
+            df = calc(df)
             # 分钟线最后一根可能未走完取倒数第二根；日线取最后一根
             row = df.iloc[-1] if per == "D" else df.iloc[-2]
             key, bar_id = f"{sym}-{per}", str(row["datetime"])
@@ -168,9 +200,8 @@ def main():
             elif bool(row["KONG"]):
                 kong_msgs.append(f"> <font color=\"info\">↓ 做空</font> **{name}({sym})** {ex} {ptxt}  收盘 {row['close']}  K线 {bar_id}")
                 state[key] = bar_id
-            time.sleep(0.2)
 
-    print(f"停牌跳过 {len(stale)} 个，取数失败 {len(failed)} 个")
+    print(f"停牌跳过 {stale} 个")
     if duo_msgs or kong_msgs:
         body = f"## 启动点12345 信号  {now:%m-%d %H:%M}\n"
         if duo_msgs:
@@ -180,7 +211,7 @@ def main():
         if not wecom_push(body):
             raise SystemExit("推送失败：请检查 WECOM_WEBHOOK")
     json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    print("done, 多:", len(duo_msgs), "空:", len(kong_msgs))
+    print("done, 多:", len(duo_msgs), "空:", len(kong_msgs), f"总耗时 {time.time()-t0:.0f} 秒")
 
 
 if __name__ == "__main__":
