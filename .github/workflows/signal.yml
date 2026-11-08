@@ -2,41 +2,37 @@ name: qidian12345-signal
 
 on:
   schedule:
-    # GitHub 用 UTC。北京时间 9:00-15:45 与 21:00-02:45 每15分钟一次（含夜盘）
+    # GitHub cron 为 UTC 时间。北京 09:00-15:30 → UTC 01-07；夜盘 21:00-02:30 → UTC 13-18
     - cron: "*/15 1-7 * * 1-5"
     - cron: "*/15 13-18 * * 1-5"
-    - cron: "*/15 13-23 * * 0"
   workflow_dispatch:
 
 permissions:
   contents: write
 
 concurrency:
-  group: qidian-scan
+  group: scan
   cancel-in-progress: false
 
 jobs:
   scan:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
           cache: pip
-
       - run: pip install -r requirements.txt
-
-      - name: 扫描并推送
+      - run: python scan.py
         env:
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
-        run: python scan.py
-
       - name: 保存去重状态
         run: |
-          git config user.name "github-actions"
-          git config user.email "github-actions@users.noreply.github.com"
+          git config user.name "bot"
+          git config user.email "bot@users.noreply.github.com"
           git add state.json
-          git diff --cached --quiet || (git commit -m "更新去重状态 [skip ci]" && git push)
+          git commit -m "update state" || echo "no change"
+          git pull --rebase || true
+          git push

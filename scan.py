@@ -1,56 +1,60 @@
 # -*- coding: utf-8 -*-
-"""启动点12345 多空信号 —— 云端扫描 + 企业微信推送（逻辑与文华指标一致）
+"""启动点12345 多空信号 —— 全市场主力合约扫描 + 企业微信群机器人推送（逻辑与文华指标一致）
 
 注意：本文件不能命名为 signal.py —— 会遮蔽 Python 标准库 signal 模块，
-导致 pandas/pyarrow 初始化时循环导入崩溃。
+导致 pandas/pyarrow 初始化时循环导入崩溃（实测 AttributeError: partially
+initialized module 'pandas'）。
 """
 import os, json, time
 from datetime import datetime, timedelta, timezone
-
 import requests
 import pandas as pd
 import akshare as ak
 
 # ========= 可调参数 =========
-SYMBOLS = ["RB0", "I0", "MA0", "TA0", "AU0", "CU0", "M0", "SA0"]   # 新浪主力连续代码
-PERIODS = ["15", "30", "60", "D"]        # 分钟周期: 1/5/15/30/60 ；日线: D
+PERIODS = ["15", "30", "60", "D"]      # 分钟周期可选 1/5/15/30/60；D=日线
 N1, N2, N3 = 5, 10, 20
 L1, L2 = 60, 120
 ZH, ZP, ZF, ZQ = 0.6, 0.4, 0.8, 10
-WECOM_WEBHOOK = os.environ.get("WECOM_WEBHOOK", "")   # 企业微信机器人，放在 GitHub Secrets
+WECOM_WEBHOOK = os.environ.get("WECOM_WEBHOOK", "")   # 企业微信群机器人完整 Webhook 地址
 STATE_FILE = "state.json"
+EXCLUDE = set()                        # 不想扫的品种代码，例如 {"WR0", "BB0"}
+STALE_DAYS = 10                        # 最后一根K线超过这么多天视为停牌，跳过
 BJ = timezone(timedelta(hours=8))
-WECOM_LIMIT = 2000   # 企业微信 text 消息约 2048 字节，留余量
+
+# 接口失败时的回退品种表（六大交易所，新浪主力连续代码 = 品种代码+0）
+FALLBACK = {
+    "上期所": ["CU","AL","ZN","PB","NI","SN","AU","AG","RB","WR","HC","SS","FU","BU","RU","SP","AO","BR","EC"],
+    "能源中心": ["SC","NR","LU","BC"],
+    "大商所": ["A","B","M","Y","P","C","CS","JD","LH","L","V","PP","EG","EB","PG","J","JM","I","FB","BB","RR","LG"],
+    "郑商所": ["SR","CF","CY","ZC","TA","MA","FG","SA","UR","OI","RM","RS","AP","CJ","PK","PF","SF","SM","SH","PX","PR","WH","PM","RI","LR","JR"],
+    "广期所": ["SI","LC","PS"],
+    "中金所": ["IF","IH","IC","IM","T","TF","TS","TL"],
+}
 
 
 def now_bj():
     return datetime.now(BJ)
 
 
-def _chunks(text, limit):
-    """按行切分，保证每段编码后不超过 limit 字节。"""
-    out, cur = [], ""
-    for line in text.split("\n"):
-        candidate = f"{cur}\n{line}" if cur else line
-        if len(candidate.encode()) <= limit:
-            cur = candidate
-            continue
-        if cur:
-            out.append(cur)
-        while len(line.encode()) > limit:
-            cut = limit // 3
-            out.append(line[:cut])
-            line = line[cut:]
-        cur = line
-    if cur:
-        out.append(cur)
+def get_symbols():
+    """返回 [(代码, 名称, 交易所)]，优先从新浪动态获取全部主力连续合约"""
+    try:
+        df = ak.futures_display_main_sina()
+        out = [(r["symbol"], r["name"], r.get("exchange", "")) for _, r in df.iterrows()]
+        if len(out) >= 40:
+            return [s for s in out if s[0] not in EXCLUDE]
+    except Exception as e:
+        print("动态获取主力合约列表失败，使用内置表：", e)
+    out = []
+    for ex, codes in FALLBACK.items():
+        out += [(c + "0", c, ex) for c in codes if c + "0" not in EXCLUDE]
     return out
 
 
 def fetch(symbol: str, period: str) -> pd.DataFrame:
     if period == "D":
-        df = ak.futures_zh_daily_sina(symbol=symbol)
-        df = df.rename(columns={"date": "datetime"})
+        df = ak.futures_zh_daily_sina(symbol=symbol).rename(columns={"date": "datetime"})
     else:
         df = ak.futures_zh_minute_sina(symbol=symbol, period=period)
     df = df[["datetime", "open", "high", "low", "close"]].astype(
@@ -62,10 +66,9 @@ def calc(df: pd.DataFrame) -> pd.DataFrame:
     c, h, l = df["close"], df["high"], df["low"]
     ma1, ma2, ma3 = c.rolling(N1).mean(), c.rolling(N2).mean(), c.rolling(N3).mean()
     ma4, ma5 = c.rolling(L1).mean(), c.rolling(L2).mean()
-
     maxs = pd.concat([ma1, ma2, ma3], axis=1).max(axis=1)
     mins = pd.concat([ma1, ma2, ma3], axis=1).min(axis=1)
-    # 1 粘合（近3根任一）
+    # 1 粘合
     nh = (maxs - mins) / c * 100 < ZH
     nh3 = nh | nh.shift(1, fill_value=False) | nh.shift(2, fill_value=False)
     # 3 走平
@@ -87,32 +90,40 @@ def calc(df: pd.DataFrame) -> pd.DataFrame:
     dnall = (c < ma1) & (c < ma2) & (c < ma3)
     tpd = upall & ~upall.shift(1, fill_value=False)
     tpk = dnall & ~dnall.shift(1, fill_value=False)
-
     df = df.copy()
     df["DUO"] = nh3 & zpx & sf & tpd & (lduo | lnh)
     df["KONG"] = nh3 & zpx & sf & tpk & (lkong | lnh)
     return df
 
 
-def push(title: str, body: str) -> bool:
-    """推送到企业微信群机器人。返回是否全部成功。"""
+def wecom_push(text: str) -> bool:
+    """企业微信群机器人 markdown 推送；超长自动分段，频率≤20条/分钟。返回是否全部成功。"""
     if not WECOM_WEBHOOK:
-        print("未配置 WECOM_WEBHOOK，仅打印：\n", title, "\n", body)
+        print("未配置 WECOM_WEBHOOK，仅打印：\n", text)
         return False
+    chunks, cur = [], ""
+    for line in text.split("\n"):
+        if len((cur + line + "\n").encode("utf-8")) > 3800:
+            chunks.append(cur)
+            cur = ""
+        cur += line + "\n"
+    chunks.append(cur)
     ok = True
-    for part in _chunks(f"{title}\n{body}", WECOM_LIMIT):
+    for i, ch in enumerate(chunks):
         try:
-            r = requests.post(WECOM_WEBHOOK, timeout=20,
-                              json={"msgtype": "text", "text": {"content": part}})
+            r = requests.post(WECOM_WEBHOOK, json={"msgtype": "markdown",
+                                                   "markdown": {"content": ch}}, timeout=15)
             j = r.json()
             if j.get("errcode") == 0:
-                print(f"企业微信: ok ({len(part.encode())} bytes)")
+                print(f"wecom push: ok ({len(ch.encode())} bytes)")
             else:
-                print(f"企业微信失败: errcode={j.get('errcode')} {j.get('errmsg')}")
+                print(f"wecom 失败: {j}")
                 ok = False
         except Exception as e:
-            print(f"企业微信异常: {e}")
+            print("wecom 异常:", e)
             ok = False
+        if i < len(chunks) - 1:
+            time.sleep(3.5)
     return ok
 
 
@@ -121,42 +132,55 @@ def main():
         state = json.load(open(STATE_FILE, encoding="utf-8"))
     except Exception:
         state = {}
-    msgs = []
+    symbols = get_symbols()
     now = now_bj()
-    for sym in SYMBOLS:
+    print(f"扫描标的 {len(symbols)} 个 × 周期 {PERIODS}")
+    duo_msgs, kong_msgs = [], []
+    stale, failed = [], []
+
+    for sym, name, ex in symbols:
         for per in PERIODS:
             try:
                 df = calc(fetch(sym, per))
             except Exception as e:
                 print(f"{sym}-{per} 取数失败: {e}")
+                failed.append(f"{sym}-{per}")
                 continue
-            if df.empty:
+            if len(df) < L2 + 5:
                 continue
-            # 日线：盘中取到的最后一根是当天未收盘的K线，此时判断会产出假信号，跳过
-            if per == "D":
-                last_day = pd.to_datetime(df["datetime"].iloc[-1]).date()
-                if last_day == now.date() and now.hour < 15:
-                    continue
-            # 分钟线最后一根可能未走完，取倒数第二根；日线取最后一根（已收盘）
+            # 停牌品种：最后一根K线停在很久以前，跳过，避免推历史僵尸信号
+            last_dt = pd.to_datetime(df["datetime"].iloc[-1])
+            if (now.replace(tzinfo=None) - last_dt).days > STALE_DAYS:
+                stale.append(f"{sym}-{per}")
+                continue
+            # 日线：盘中最后一根是当天未收盘的K线，判断会产出假信号，跳过
+            if per == "D" and last_dt.date() == now.date() and now.hour < 15:
+                continue
+            # 分钟线最后一根可能未走完取倒数第二根；日线取最后一根
             row = df.iloc[-1] if per == "D" else df.iloc[-2]
-            key = f"{sym}-{per}"
-            bar_id = str(row["datetime"])
+            key, bar_id = f"{sym}-{per}", str(row["datetime"])
             if state.get(key) == bar_id:
                 continue
-            if bool(row["DUO"]) or bool(row["KONG"]):
-                side = "🔴 做多 ↑" if row["DUO"] else "🟢 做空 ↓"
-                # 企业微信 text 消息不渲染 Markdown，不要用 ** 加粗
-                msgs.append(f"{sym} {per}{'日线' if per=='D' else '分钟'}  {side}  "
-                            f"收盘 {row['close']}  K线 {bar_id}")
+            ptxt = "日线" if per == "D" else f"{per}分钟"
+            if bool(row["DUO"]):
+                duo_msgs.append(f"> <font color=\"warning\">↑ 做多</font> **{name}({sym})** {ex} {ptxt}  收盘 {row['close']}  K线 {bar_id}")
                 state[key] = bar_id
-            time.sleep(0.5)
+            elif bool(row["KONG"]):
+                kong_msgs.append(f"> <font color=\"info\">↓ 做空</font> **{name}({sym})** {ex} {ptxt}  收盘 {row['close']}  K线 {bar_id}")
+                state[key] = bar_id
+            time.sleep(0.2)
 
-    if msgs:
-        if not push("启动点12345 信号（%d条）" % len(msgs),
-                    "\n".join(msgs) + f"\n\n扫描时间 {now:%Y-%m-%d %H:%M}"):
+    print(f"停牌跳过 {len(stale)} 个，取数失败 {len(failed)} 个")
+    if duo_msgs or kong_msgs:
+        body = f"## 启动点12345 信号  {now:%m-%d %H:%M}\n"
+        if duo_msgs:
+            body += f"**🔴 做多 {len(duo_msgs)} 个**\n" + "\n".join(duo_msgs) + "\n"
+        if kong_msgs:
+            body += f"**🟢 做空 {len(kong_msgs)} 个**\n" + "\n".join(kong_msgs) + "\n"
+        if not wecom_push(body):
             raise SystemExit("推送失败：请检查 WECOM_WEBHOOK")
     json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
-    print("done, signals:", len(msgs))
+    print("done, 多:", len(duo_msgs), "空:", len(kong_msgs))
 
 
 if __name__ == "__main__":
