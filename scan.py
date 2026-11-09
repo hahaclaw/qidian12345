@@ -81,7 +81,7 @@ def _mark_names():
     global _MARK_NAMES
     if _MARK_NAMES is None:
         try:
-            _MARK_NAMES = [str(x) for x in ak.futures_symbol_mark()["symbol"].tolist()]
+            _MARK_NAMES = [str(x) for x in _retry(ak.futures_symbol_mark)["symbol"].tolist()]
         except Exception:
             _MARK_NAMES = []
     return _MARK_NAMES
@@ -181,10 +181,22 @@ def _clean_name(name: str) -> str:
     return str(name).replace("连续", "").replace("期货", "").strip()
 
 
+def _retry(fn, tries=3, **kw):
+    """上游偶发返回 HTML 错误页，重试几次。"""
+    for i in range(tries):
+        try:
+            return fn(**kw)
+        except Exception as e:
+            if i == tries - 1:
+                raise
+            print(f"  取数重试 {i+1}/{tries-1}: {type(e).__name__}")
+            time.sleep(2 * (i + 1))
+
+
 def get_symbols():
     """返回 [(代码, 名称, 交易所)]，优先从新浪动态获取全部主力连续合约"""
     try:
-        df = ak.futures_display_main_sina()
+        df = _retry(ak.futures_display_main_sina)
         out = [(r["symbol"], _clean_name(r["name"]), r.get("exchange", "")) for _, r in df.iterrows()]
         if len(out) >= 40:
             have = {s[0] for s in out}
