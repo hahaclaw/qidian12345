@@ -48,6 +48,29 @@ FALLBACK = {
     "中金所": ["IF","IH","IC","IM","T","TF","TS","TL"],
 }
 
+# 新浪交易所英文名 → 中文
+EX_NAME = {"shfe": "上期所", "dce": "大商所", "czce": "郑商所",
+           "ine": "能源中心", "gfex": "广期所", "cffex": "中金所"}
+
+# 文华财经/手机交易软件里的品种名（与新浪命名不一致的才需要列）
+# 文华搜索支持字母品种代码，主连合约在文华里叫「XX主连」
+WH_NAME = {
+    "AU": "沪金", "AG": "沪银", "CU": "沪铜", "AL": "沪铝", "ZN": "沪锌",
+    "PB": "沪铅", "NI": "沪镍", "SN": "沪锡",
+    "RB": "螺纹", "HC": "热卷", "RU": "橡胶", "FU": "燃油",
+    "SC": "原油", "BR": "合成橡胶", "OP": "胶版纸", "EC": "集运欧线",
+    "PP": "聚丙烯", "PG": "液化气", "BZ": "纯苯",
+    "IF": "沪深300", "IH": "上证50", "IC": "中证500", "IM": "中证1000",
+    "T": "十年国债", "TF": "五年国债", "TS": "两年国债", "TL": "三十年国债",
+}
+
+
+def label(sym: str, name: str) -> str:
+    """给消息用的品种标识：文华可搜的名字 + 品种字母代码。
+    新浪的 AU0 这种「品种+0」写法文华不认，去掉末尾 0 只留 AU。"""
+    code = sym[:-1] if sym.endswith("0") else sym
+    return f"{WH_NAME.get(code, name)}({code})"
+
 
 def now_bj():
     return datetime.now(BJ)
@@ -237,11 +260,12 @@ def main():
             if state.get(key) == bar_id:
                 continue
             ptxt = "日线" if per == "D" else f"{per}分钟"
+            tag = f"**{label(sym, name)}** {EX_NAME.get(ex, ex)}"
             if bool(row["DUO"]):
-                duo_msgs.append(f"> <font color=\"warning\">↑ 做多</font> **{name}({sym})** {ex} {ptxt}  收盘 {row['close']}  K线 {bar_id}")
+                duo_msgs.append(f"> <font color=\"warning\">↑ 做多</font> {tag} {ptxt}  收盘 {row['close']}  K线 {bar_id}")
                 state[key] = bar_id
             elif bool(row["KONG"]):
-                kong_msgs.append(f"> <font color=\"info\">↓ 做空</font> **{name}({sym})** {ex} {ptxt}  收盘 {row['close']}  K线 {bar_id}")
+                kong_msgs.append(f"> <font color=\"info\">↓ 做空</font> {tag} {ptxt}  收盘 {row['close']}  K线 {bar_id}")
                 state[key] = bar_id
 
     print(f"停牌跳过 {stale} 个")
