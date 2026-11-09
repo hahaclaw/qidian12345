@@ -66,10 +66,10 @@ WH_NAME = {
 
 
 def label(sym: str, name: str) -> str:
-    """消息里的品种标识：文华名称 + 「连续」+ 新浪连续代码。
-    这里的数据天生就是主力连续序列（虚拟合约，非单个交割月），所以标注「连续」。"""
+    """消息里的品种标识，采用文华财经的叫法：品种名 + 「主连」+ 新浪代码。
+    文华把这类序列叫「主连」，新浪叫「连续」，统一用文华叫法方便对照。"""
     code = sym[:-1] if sym.endswith("0") else sym
-    return f"{WH_NAME.get(code, name)}连续({sym})"
+    return f"{WH_NAME.get(code, name)}主连({sym})"
 
 
 _MAIN_CACHE = {}
@@ -169,7 +169,7 @@ def main_txt(sym: str, name: str) -> str:
     letters = code[: len(code) - len(digits)] if digits else code
     wh = WH_NAME.get(letters, name)
     sep = " " if wh[-1:].isdigit() else ""      # 上证50 + 2612 避免粘成 上证502612
-    return f"  主力 {wh}{sep}{digits}({code})"
+    return f"  主力 {wh}{sep}{digits}({code})[M]"
 
 
 def now_bj():
