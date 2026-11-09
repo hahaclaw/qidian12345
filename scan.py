@@ -24,6 +24,17 @@ STALE_DAYS = 10                        # 最后一根K线超过这么多天视�
 WORKERS = 8                            # 并发取数线程数
 BJ = timezone(timedelta(hours=8))
 
+# 活跃度门槛：只扫主力品种。低于任一门槛视为不活跃（成交清淡、信号无意义），整品种跳过。
+# 依据：主力连续合约 XX0，5 日成交量中位数 / 最新持仓量。
+try:
+    MIN_VOL = int((os.getenv("MIN_VOL") or "10000").strip())
+except ValueError:
+    MIN_VOL = 10000
+try:
+    MIN_OI = int((os.getenv("MIN_OI") or "10000").strip())
+except ValueError:
+    MIN_OI = 10000
+
 # 新浪 futures_display_main_sina() 漏掉但能正常取数的主力品种
 EXTRA = {"TL0": ("30年期国债", "cffex"), "T0": ("10年期国债", "cffex")}
 
@@ -71,9 +82,20 @@ def fetch(symbol: str, period: str) -> pd.DataFrame:
         df = ak.futures_zh_daily_sina(symbol=symbol).rename(columns={"date": "datetime"})
     else:
         df = ak.futures_zh_minute_sina(symbol=symbol, period=period)
-    df = df[["datetime", "open", "high", "low", "close"]].astype(
-        {"open": float, "high": float, "low": float, "close": float})
+    cols = ["datetime", "open", "high", "low", "close"]
+    cols += [c for c in ("volume", "hold") if c in df.columns]   # 活跃度判断要用
+    df = df[cols].astype({c: float for c in cols if c != "datetime"})
     return df.reset_index(drop=True)
+
+
+def activity(df: pd.DataFrame):
+    """返回 (5日成交量中位数, 最新持仓量)。缺列时返回 None。"""
+    try:
+        vol = float(df["volume"].astype(float).tail(5).median())
+        oi = float(df["hold"].astype(float).iloc[-1])
+        return vol, oi
+    except Exception:
+        return None
 
 
 def calc(df: pd.DataFrame) -> pd.DataFrame:
@@ -170,9 +192,30 @@ def main():
     data, failed = fetch_all(symbols)
     print(f"取数完成：成功 {len(data)} 个，失败 {len(failed)} 个，耗时 {time.time()-t0:.0f} 秒")
 
+    # 活跃度过滤：只保留主力品种，成交清淡的整品种跳过（含其所有周期）
+    inactive, active = [], []
+    for sym, name, ex in symbols:
+        d = data.get((sym, "D"))
+        if d is None or d.empty:
+            continue
+        act = activity(d)
+        if act is None:
+            active.append((sym, name, ex))
+            continue
+        vol, oi = act
+        if vol < MIN_VOL or oi < MIN_OI:
+            inactive.append((sym, name, vol, oi))
+        else:
+            active.append((sym, name, ex))
+    if inactive:
+        print(f"不活跃跳过 {len(inactive)} 个（门槛 成交量{MIN_VOL} / 持仓{MIN_OI}）：")
+        for sym, name, vol, oi in sorted(inactive, key=lambda x: x[2]):
+            print(f"  {sym} {name}: 5日量 {vol:.0f} 持仓 {oi:.0f}")
+    print(f"实际计算 {len(active)} 个品种")
+
     duo_msgs, kong_msgs = [], []
     stale = 0
-    for sym, name, ex in symbols:
+    for sym, name, ex in active:
         for per in PERIODS:
             df = data.get((sym, per))
             if df is None or df.empty:

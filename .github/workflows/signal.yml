@@ -28,6 +28,8 @@ jobs:
       - run: python scan.py
         env:
           WECOM_WEBHOOK: ${{ secrets.WECOM_WEBHOOK }}
+          MIN_VOL: ${{ vars.MIN_VOL }}
+          MIN_OI: ${{ vars.MIN_OI }}
       - name: 保存去重状态
         run: |
           git config user.name "bot"
