@@ -66,10 +66,110 @@ WH_NAME = {
 
 
 def label(sym: str, name: str) -> str:
-    """给消息用的品种标识：文华可搜的名字 + 品种字母代码。
-    新浪的 AU0 这种「品种+0」写法文华不认，去掉末尾 0 只留 AU。"""
+    """消息里的品种标识：文华名称 + 「连续」+ 新浪连续代码。
+    这里的数据天生就是主力连续序列（虚拟合约，非单个交割月），所以标注「连续」。"""
     code = sym[:-1] if sym.endswith("0") else sym
-    return f"{WH_NAME.get(code, name)}({code})"
+    return f"{WH_NAME.get(code, name)}连续({sym})"
+
+
+_MAIN_CACHE = {}
+_MARK_NAMES = None
+
+
+def _mark_names():
+    """新浪「品种命名表」里的中文名列表，用于实时接口取名。"""
+    global _MARK_NAMES
+    if _MARK_NAMES is None:
+        try:
+            _MARK_NAMES = [str(x) for x in ak.futures_symbol_mark()["symbol"].tolist()]
+        except Exception:
+            _MARK_NAMES = []
+    return _MARK_NAMES
+
+
+def _from_realtime(keys):
+    """在实时接口里按持仓量找主力合约（排除 XX0 连续合约）。"""
+    seen = set()
+    for key in keys:
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        try:
+            df = ak.futures_zh_realtime(symbol=key)
+            if df is None or df.empty:
+                continue
+            df = df[~df["symbol"].astype(str).str.endswith("0")]
+            if df.empty:
+                continue
+            row = df.sort_values("position", ascending=False).iloc[0]
+            code = str(row["symbol"]).strip()
+            digits = "".join(ch for ch in code if ch.isdigit())
+            if digits:
+                return (code, digits, float(row["position"]))
+        except Exception:
+            continue
+    return None
+
+
+def _from_months(letters: str):
+    """兜底：按品种代码 + 未来12个月代码逐个试，取持仓量最大的。"""
+    now = now_bj()
+    codes = []
+    for i in range(12):
+        yy = now.year + (now.month - 1 + i) // 12
+        mm = (now.month - 1 + i) % 12 + 1
+        codes.append((f"{yy % 100:02d}{mm:02d}"))
+    best = None
+
+    def probe(mm):
+        try:
+            d = ak.futures_zh_daily_sina(symbol=f"{letters}{mm}")
+            if d is None or d.empty:
+                return None
+            return (f"{letters}{mm}", mm, float(d["hold"].iloc[-1]))
+        except Exception:
+            return None
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        for r in pool.map(probe, codes):
+            if r and (best is None or r[2] > best[2]):
+                best = r
+    return best
+
+
+def main_contract(sym: str, sina_name: str):
+    """查询该品种当前主力合约，返回 (代码, 月份数字, 持仓量) 或 None。
+    例如 黄金 -> ('AU2612', '2612', 149043)。只对产生信号的品种调用，开销小。"""
+    if sym in _MAIN_CACHE:
+        return _MAIN_CACHE[sym]
+    code0 = sym[:-1] if sym.endswith("0") else sym
+    wh = WH_NAME.get(code0)
+
+    # 候选名：新浪显示名、文华名，以及品种表里以它们开头的名字（如「上证50指数期货」）
+    keys = [sina_name, wh, sina_name.replace("指数", "")]
+    for mk in _mark_names():
+        for base in (sina_name, wh):
+            if base and mk.startswith(base) and mk not in keys:
+                keys.append(mk)
+                break
+
+    res = _from_realtime(keys)
+    if res is None:
+        res = _from_months(code0)
+    _MAIN_CACHE[sym] = res
+    return res
+
+
+def main_txt(sym: str, name: str) -> str:
+    """生成『主力 xxx(CODE)』片段，查不到就返回空串。"""
+    mc = main_contract(sym, name)
+    if not mc:
+        return ""
+    code, digits, _ = mc
+    letters = code[: len(code) - len(digits)] if digits else code
+    wh = WH_NAME.get(letters, name)
+    sep = " " if wh[-1:].isdigit() else ""      # 上证50 + 2612 避免粘成 上证502612
+    return f"  主力 {wh}{sep}{digits}({code})"
 
 
 def now_bj():
@@ -261,11 +361,12 @@ def main():
                 continue
             ptxt = "日线" if per == "D" else f"{per}分钟"
             tag = f"**{label(sym, name)}** {EX_NAME.get(ex, ex)}"
+            extra = main_txt(sym, name)
             if bool(row["DUO"]):
-                duo_msgs.append(f"> <font color=\"warning\">↑ 做多</font> {tag} {ptxt}  收盘 {row['close']}  K线 {bar_id}")
+                duo_msgs.append(f"> <font color=\"warning\">↑ 做多</font> {tag} {ptxt}  收盘 {row['close']}{extra}  K线 {bar_id}")
                 state[key] = bar_id
             elif bool(row["KONG"]):
-                kong_msgs.append(f"> <font color=\"info\">↓ 做空</font> {tag} {ptxt}  收盘 {row['close']}  K线 {bar_id}")
+                kong_msgs.append(f"> <font color=\"info\">↓ 做空</font> {tag} {ptxt}  收盘 {row['close']}{extra}  K线 {bar_id}")
                 state[key] = bar_id
 
     print(f"停牌跳过 {stale} 个")
