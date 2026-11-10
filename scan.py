@@ -5,18 +5,30 @@
 导致 pandas/pyarrow 初始化时循环导入崩溃（实测 AttributeError: partially
 initialized module 'pandas'）。
 """
-import os, json, time
+import os, json, time, math
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 import requests
 import pandas as pd
 import akshare as ak
 
-# ========= 可调参数 =========
+# ========= 信号参数 =========
 PERIODS = ["15", "30", "60", "D"]      # 分钟周期可选 1/5/15/30/60；D=日线
 N1, N2, N3 = 5, 10, 20
 L1, L2 = 60, 120
 ZH, ZP, ZF, ZQ = 0.6, 0.4, 0.8, 10
+
+# ========= 资金管理参数 =========
+def _num(name, default):
+    try:
+        return float((os.getenv(name) or str(default)).strip())
+    except ValueError:
+        return float(default)
+
+ACCOUNT = _num("ACCOUNT", 50000)     # 账户余额（元）
+RISK_PCT = _num("RISK_PCT", 2)       # 单笔风险比例（%）
+RR = _num("RR", 2)                   # 盈亏比：目标价 = 入场 ± RR × 单位风险
+
 WECOM_WEBHOOK = os.environ.get("WECOM_WEBHOOK", "")   # 企业微信群机器人完整 Webhook 地址
 STATE_FILE = "state.json"
 EXCLUDE = set()                        # 不想扫的品种代码，例如 {"WR0", "BB0"}
@@ -51,6 +63,33 @@ FALLBACK = {
 # 新浪交易所英文名 → 中文
 EX_NAME = {"shfe": "上期所", "dce": "大商所", "czce": "郑商所",
            "ine": "能源中心", "gfex": "广期所", "cffex": "中金所"}
+
+# 品种 → (交易单位/合约乘数, 最小变动价位)
+# 用于仓位计算：每手风险 = |入场价 − 止损价| × 乘数
+SPEC = {
+    # 上期所 / 能源中心
+    "CU": (5, 10), "AL": (5, 5), "ZN": (5, 5), "PB": (5, 5), "NI": (1, 10), "SN": (1, 10),
+    "AU": (1000, 0.02), "AG": (15, 1), "RB": (10, 1), "WR": (10, 1), "HC": (10, 1),
+    "SS": (5, 5), "FU": (10, 1), "BU": (10, 1), "RU": (10, 5), "SP": (10, 2),
+    "AO": (20, 1), "BR": (5, 5), "SC": (1000, 0.1), "NR": (10, 5), "LU": (10, 1),
+    "BC": (5, 10), "EC": (50, 0.1),
+    # 大商所
+    "A": (10, 1), "B": (10, 1), "M": (10, 1), "Y": (10, 2), "P": (10, 2), "C": (10, 1),
+    "CS": (10, 1), "JD": (10, 1), "LH": (16, 5), "L": (5, 1), "V": (5, 1), "PP": (5, 1),
+    "EG": (10, 1), "EB": (5, 1), "PG": (20, 1), "J": (100, 0.5), "JM": (60, 0.5),
+    "I": (100, 0.5), "FB": (10, 0.5), "BB": (500, 0.05), "RR": (10, 1), "LG": (90, 0.5),
+    # 郑商所
+    "SR": (10, 1), "CF": (5, 5), "CY": (5, 5), "ZC": (100, 0.2), "TA": (5, 2), "MA": (10, 1),
+    "FG": (20, 1), "SA": (20, 1), "UR": (20, 1), "OI": (10, 1), "RM": (10, 1), "RS": (10, 1),
+    "AP": (10, 1), "CJ": (5, 5), "PK": (5, 2), "PF": (5, 2), "SF": (5, 2), "SM": (5, 2),
+    "SH": (30, 1), "PX": (5, 2), "PR": (15, 2), "WH": (20, 1), "PM": (50, 1), "RI": (20, 1),
+    "LR": (20, 1), "JR": (20, 1),
+    # 广期所
+    "SI": (5, 5), "LC": (1, 50), "PS": (3, 5),
+    # 中金所
+    "IF": (300, 0.2), "IH": (300, 0.2), "IC": (200, 0.2), "IM": (200, 0.2),
+    "T": (10000, 0.005), "TF": (10000, 0.005), "TS": (20000, 0.002), "TL": (10000, 0.01),
+}
 
 # 文华财经/手机交易软件里的品种名（与新浪命名不一致的才需要列）
 # 文华搜索支持字母品种代码，主连合约在文华里叫「XX主连」
@@ -273,7 +312,48 @@ def calc(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df["DUO"] = nh3 & zpx & sf & tpd & (lduo | lnh)
     df["KONG"] = nh3 & zpx & sf & tpk & (lkong | lnh)
+    # 仓位计算要用：三根短均线的上/下沿，以及近 ZQ 根的最高/最低
+    df["MAXS"], df["MINS"] = maxs, mins
+    df["LLV"], df["HHV"] = l.rolling(ZQ).min(), h.rolling(ZQ).max()
     return df
+
+
+def round_tick(x, tick):
+    """按最小变动价位取整。"""
+    return round(round(x / tick) * tick, 6)
+
+
+def position_plan(code, side, row):
+    """仓位计算文本（markdown 引用块）。
+    手数 = ⌊账户余额 × 风险比例 ÷ (|入场价 − 止损价| × 交易单位)⌋"""
+    unit, tick = SPEC.get(code, (10, 1))
+    entry = float(row["close"])
+    if side == "多":
+        stop = round_tick(min(row["LLV"], row["MINS"]) - tick, tick)
+        stop_src = f"min(近{ZQ}根最低 {row['LLV']:g}, 三均线最低 {row['MINS']:.2f}) − 1跳"
+        target = round_tick(entry + RR * (entry - stop), tick)
+    else:
+        stop = round_tick(max(row["HHV"], row["MAXS"]) + tick, tick)
+        stop_src = f"max(近{ZQ}根最高 {row['HHV']:g}, 三均线最高 {row['MAXS']:.2f}) + 1跳"
+        target = round_tick(entry - RR * (stop - entry), tick)
+
+    allow = ACCOUNT * RISK_PCT / 100
+    diff = abs(entry - stop)
+    per_lot = diff * unit
+    lots = int(math.floor(allow / per_lot)) if per_lot > 0 else 0
+    total = lots * per_lot
+    lines = [
+        f"入场价：{entry:g}（信号K线收盘）",
+        f"止损价：{stop:g}  ← {stop_src}",
+        f"目标价：{target:g}（{RR:g}R 出场参考）",
+        f"允许亏损 = {ACCOUNT:g} × {RISK_PCT:g}% = {allow:g} 元",
+        f"每手风险 = |{entry:g} − {stop:g}| × {unit} = {per_lot:g} 元",
+        (f"手数 = ⌊{allow:g} ÷ {per_lot:g}⌋ = **{lots} 手**" if lots > 0
+         else f"手数 = ⌊{allow:g} ÷ {per_lot:g}⌋ = 0 手 ⚠ 资金不足，建议放弃或缩小止损"),
+        f"实际总风险 = {lots} × {per_lot:g} = {total:g} 元"
+        f"（{(total / ACCOUNT * 100 if ACCOUNT else 0):.2f}%）",
+    ]
+    return "\n".join(">" + s for s in lines)
 
 
 def wecom_push(text: str) -> bool:
@@ -382,21 +462,26 @@ def main():
                 continue
             ptxt = "日线" if per == "D" else f"{per}分钟"
             head, ref = head_and_ref(sym, name)      # 可交易主力合约在前，主连代码作参考
-            tag = f"{head} {EX_NAME.get(ex, ex)}"
+            code0 = sym[:-1] if sym.endswith("0") else sym
             if bool(row["DUO"]):
-                duo_msgs.append(f"> <font color=\"warning\">↑ 做多</font> {tag} {ptxt}  收盘 {row['close']}  {ref}  K线 {bar_id}")
-                state[key] = bar_id
+                side = "多"
+                title = f"### <font color=\"warning\">🔴 ↑ 做多</font> {head} {EX_NAME.get(ex, ex)} {ptxt}"
             elif bool(row["KONG"]):
-                kong_msgs.append(f"> <font color=\"info\">↓ 做空</font> {tag} {ptxt}  收盘 {row['close']}  {ref}  K线 {bar_id}")
-                state[key] = bar_id
+                side = "空"
+                title = f"### <font color=\"info\">🟢 ↓ 做空</font> {head} {EX_NAME.get(ex, ex)} {ptxt}"
+            else:
+                continue
+            block = (f"{title}\n"
+                     f">K线：{bar_id} · {ref} · 收盘 {row['close']}\n"
+                     f"{position_plan(code0.upper(), side, row)}\n")
+            (duo_msgs if side == "多" else kong_msgs).append(block)
+            state[key] = bar_id
 
     print(f"停牌跳过 {stale} 个")
     if duo_msgs or kong_msgs:
-        body = f"## 启动点12345 信号  {now:%m-%d %H:%M}\n"
-        if duo_msgs:
-            body += f"**🔴 做多 {len(duo_msgs)} 个**\n" + "\n".join(duo_msgs) + "\n"
-        if kong_msgs:
-            body += f"**🟢 做空 {len(kong_msgs)} 个**\n" + "\n".join(kong_msgs) + "\n"
+        body = (f"## 启动点12345 信号  {now:%m-%d %H:%M}  多{len(duo_msgs)} / 空{len(kong_msgs)}\n"
+                f"账户 {ACCOUNT:g} 元 · 风险 {RISK_PCT:g}%/单 · 盈亏比 {RR:g}\n\n"
+                + "\n".join(duo_msgs + kong_msgs))
         print("----- 推送内容 -----\n" + body + "--------------------")   # 日志留档，便于事后核对
         if not wecom_push(body):
             raise SystemExit("推送失败：请检查 WECOM_WEBHOOK")
