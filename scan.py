@@ -397,6 +397,7 @@ def main():
             body += f"**🔴 做多 {len(duo_msgs)} 个**\n" + "\n".join(duo_msgs) + "\n"
         if kong_msgs:
             body += f"**🟢 做空 {len(kong_msgs)} 个**\n" + "\n".join(kong_msgs) + "\n"
+        print("----- 推送内容 -----\n" + body + "--------------------")   # 日志留档，便于事后核对
         if not wecom_push(body):
             raise SystemExit("推送失败：请检查 WECOM_WEBHOOK")
     json.dump(state, open(STATE_FILE, "w", encoding="utf-8"), ensure_ascii=False, indent=2)
