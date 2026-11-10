@@ -160,16 +160,25 @@ def main_contract(sym: str, sina_name: str):
     return res
 
 
-def main_txt(sym: str, name: str) -> str:
-    """生成『主力 xxx(CODE)』片段，查不到就返回空串。"""
+def trade_contract(sym: str, name: str):
+    """返回可交易主力合约的展示串，如 '氧化铝2701(AO2701)[M]'；识别失败返回 None。"""
     mc = main_contract(sym, name)
     if not mc:
-        return ""
+        return None
     code, digits, _ = mc
     letters = code[: len(code) - len(digits)] if digits else code
     wh = WH_NAME.get(letters, name)
     sep = " " if wh[-1:].isdigit() else ""      # 上证50 + 2612 避免粘成 上证502612
-    return f"  主力 {wh}{sep}{digits}({code})[M]"
+    return f"{wh}{sep}{digits}({code})[M]"
+
+
+def head_and_ref(sym: str, name: str):
+    """消息行开头的标识：优先用可交易主力合约，主连代码作参考。
+    返回 (加粗标识, 参考串)。识别不出主力时明确标注，避免误导。"""
+    tc = trade_contract(sym, name)
+    if tc:
+        return f"**{tc}**", f"主连{sym}"
+    return f"**{label(sym, name)}**", "主力未识别"
 
 
 def now_bj():
@@ -372,13 +381,13 @@ def main():
             if state.get(key) == bar_id:
                 continue
             ptxt = "日线" if per == "D" else f"{per}分钟"
-            tag = f"**{label(sym, name)}** {EX_NAME.get(ex, ex)}"
-            extra = main_txt(sym, name)
+            head, ref = head_and_ref(sym, name)      # 可交易主力合约在前，主连代码作参考
+            tag = f"{head} {EX_NAME.get(ex, ex)}"
             if bool(row["DUO"]):
-                duo_msgs.append(f"> <font color=\"warning\">↑ 做多</font> {tag} {ptxt}  收盘 {row['close']}{extra}  K线 {bar_id}")
+                duo_msgs.append(f"> <font color=\"warning\">↑ 做多</font> {tag} {ptxt}  收盘 {row['close']}  {ref}  K线 {bar_id}")
                 state[key] = bar_id
             elif bool(row["KONG"]):
-                kong_msgs.append(f"> <font color=\"info\">↓ 做空</font> {tag} {ptxt}  收盘 {row['close']}{extra}  K线 {bar_id}")
+                kong_msgs.append(f"> <font color=\"info\">↓ 做空</font> {tag} {ptxt}  收盘 {row['close']}  {ref}  K线 {bar_id}")
                 state[key] = bar_id
 
     print(f"停牌跳过 {stale} 个")
